@@ -155,7 +155,10 @@ def resolve_registered_model_version(model_name: str, model_info: object) -> int
 
 
 def resolve_domino_url() -> tuple[str, str]:
-    return os.environ.get("DOMINO_URL", "https://cloud-dogfood.domino.tech"), "DOMINO_URL"
+    url = os.environ.get("DOMINO_URL", "")
+    if not url:
+        url = os.environ.get("DOMINO_API_HOST", "")
+    return url, "DOMINO_URL"
 
 
 def resolve_environment_id(
@@ -172,19 +175,21 @@ def resolve_environment_id(
 
     # Get the project's default environment ID from the Domino API
     headers = {"X-Domino-Api-Key": api_key}
-    try:
-        response = requests.get(
-            f"{domino_url}/v4/projects/{project_id}/settings",
-            headers=headers,
-            timeout=30,
-        )
-        response.raise_for_status()
-        settings = response.json()
-        default_env = settings.get("defaultEnvironmentId")
-        if default_env:
-            return default_env, "project default environment"
-    except requests.RequestException as exc:
-        print(f"Warning: could not fetch project settings: {exc}")
+
+    # Try /v4/projects/{id}/settings first
+    for endpoint in [
+        f"{domino_url}/v4/projects/{project_id}/settings",
+        f"{domino_url}/api/projects/v1/projects/{project_id}/settings",
+    ]:
+        try:
+            response = requests.get(endpoint, headers=headers, timeout=30)
+            response.raise_for_status()
+            settings = response.json()
+            default_env = settings.get("defaultEnvironmentId")
+            if default_env:
+                return default_env, "project default environment"
+        except requests.RequestException:
+            continue
 
     return None, "no default environment found for project"
 
