@@ -158,28 +158,6 @@ def resolve_domino_url() -> tuple[str, str]:
     return os.environ.get("DOMINO_URL", "https://cloud-dogfood.domino.tech"), "DOMINO_URL"
 
 
-def _resolve_environment_from_run(domino_url: str, api_key: str) -> str | None:
-    """Try to get the environment ID from the current Domino run."""
-    run_id = os.environ.get("DOMINO_RUN_ID", "")
-    if not run_id:
-        return None
-    headers = {"X-Domino-Api-Key": api_key}
-    try:
-        response = requests.get(
-            f"{domino_url}/v4/jobs/{run_id}",
-            headers=headers,
-            timeout=30,
-        )
-        response.raise_for_status()
-        payload = response.json()
-        env_id = payload.get("environmentId")
-        if env_id:
-            return env_id
-    except requests.RequestException:
-        pass
-    return None
-
-
 def resolve_environment_id(
     domino_url: str,
     api_key: str,
@@ -189,60 +167,26 @@ def resolve_environment_id(
     if environment_id:
         return environment_id, "DOMINO_ENVIRONMENT_ID"
 
-    if not (domino_url and api_key):
-        return None, "missing DOMINO_URL/DOMINO_USER_API_KEY"
+    if not (domino_url and api_key and project_id):
+        return None, "missing DOMINO_URL/DOMINO_USER_API_KEY/DOMINO_PROJECT_ID"
 
-    # Try to get the environment from the current run
-    run_env = _resolve_environment_from_run(domino_url, api_key)
-    if run_env:
-        return run_env, "current Domino run"
-
-    if project_id:
-        headers = {"X-Domino-Api-Key": api_key}
-        try:
-            response = requests.get(
-                f"{domino_url}/v4/projects/{project_id}/settings",
-                headers=headers,
-                timeout=30,
-            )
-            response.raise_for_status()
-        except requests.RequestException:
-            response = None
-        if response is not None:
-            content_type = response.headers.get("content-type", "")
-            if "application/json" in content_type:
-                try:
-                    payload = response.json()
-                except requests.JSONDecodeError:
-                    payload = None
-                if isinstance(payload, dict):
-                    default_env = payload.get("defaultEnvironmentId")
-                    if default_env:
-                        return default_env, "project settings"
-
-    env_name = os.environ.get("DOMINO_ENVIRONMENT_NAME", "")
+    # Get the project's default environment ID from the Domino API
     headers = {"X-Domino-Api-Key": api_key}
     try:
         response = requests.get(
-            f"{domino_url}/api/environments/beta/environments",
-            params={"limit": 100},
+            f"{domino_url}/v4/projects/{project_id}/settings",
             headers=headers,
             timeout=30,
         )
         response.raise_for_status()
-    except requests.RequestException:
-        return None, "environment lookup failed"
+        settings = response.json()
+        default_env = settings.get("defaultEnvironmentId")
+        if default_env:
+            return default_env, "project default environment"
+    except requests.RequestException as exc:
+        print(f"Warning: could not fetch project settings: {exc}")
 
-    payload = response.json()
-    environments = payload.get("environments", [])
-    if env_name:
-        for env in environments:
-            if env.get("name") == env_name and not env.get("archived"):
-                return env.get("id"), "DOMINO_ENVIRONMENT_NAME"
-    for env in environments:
-        if not env.get("archived"):
-            return env.get("id"), "fallback environment list"
-    return None, "no environments found"
+    return None, "no default environment found for project"
 
 
 def normalize_endpoint_name(name: str) -> str:
