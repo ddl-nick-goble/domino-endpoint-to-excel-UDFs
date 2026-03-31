@@ -24,7 +24,7 @@ from typing import Any
 import requests
 
 # Environment configuration
-DOMINO_URL = os.environ.get("DOMINO_URL", "")
+DOMINO_URL = (os.environ.get("DOMINO_URL") or os.environ.get("DOMINO_API_HOST") or "").rstrip("/")
 API_KEY = os.environ.get("DOMINO_USER_API_KEY", "")
 PROJECT_ID = os.environ.get("DOMINO_PROJECT_ID", "")
 PROJECT_NAME = os.environ.get("DOMINO_PROJECT_NAME", "")
