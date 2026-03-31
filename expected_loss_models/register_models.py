@@ -158,6 +158,28 @@ def resolve_domino_url() -> tuple[str, str]:
     return os.environ.get("DOMINO_URL", "https://cloud-dogfood.domino.tech"), "DOMINO_URL"
 
 
+def _resolve_environment_from_run(domino_url: str, api_key: str) -> str | None:
+    """Try to get the environment ID from the current Domino run."""
+    run_id = os.environ.get("DOMINO_RUN_ID", "")
+    if not run_id:
+        return None
+    headers = {"X-Domino-Api-Key": api_key}
+    try:
+        response = requests.get(
+            f"{domino_url}/v4/jobs/{run_id}",
+            headers=headers,
+            timeout=30,
+        )
+        response.raise_for_status()
+        payload = response.json()
+        env_id = payload.get("environmentId")
+        if env_id:
+            return env_id
+    except requests.RequestException:
+        pass
+    return None
+
+
 def resolve_environment_id(
     domino_url: str,
     api_key: str,
@@ -169,6 +191,11 @@ def resolve_environment_id(
 
     if not (domino_url and api_key):
         return None, "missing DOMINO_URL/DOMINO_USER_API_KEY"
+
+    # Try to get the environment from the current run
+    run_env = _resolve_environment_from_run(domino_url, api_key)
+    if run_env:
+        return run_env, "current Domino run"
 
     if project_id:
         headers = {"X-Domino-Api-Key": api_key}
