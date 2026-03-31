@@ -24,7 +24,11 @@ from typing import Any
 import requests
 
 # Environment configuration
-DOMINO_URL = (os.environ.get("DOMINO_URL") or os.environ.get("DOMINO_API_HOST") or "").rstrip("/")
+# DOMINO_URL is the external-facing URL (used in generated Excel UDFs).
+# _API_BASE is what we actually call during discovery — prefers the local API
+# proxy when running inside Domino, falls back to the external URL.
+DOMINO_URL = os.environ.get("DOMINO_URL", "").rstrip("/")
+_API_BASE = (DOMINO_URL or os.environ.get("DOMINO_API_PROXY") or "").rstrip("/")
 API_KEY = os.environ.get("DOMINO_USER_API_KEY", "")
 PROJECT_ID = os.environ.get("DOMINO_PROJECT_ID", "")
 PROJECT_NAME = os.environ.get("DOMINO_PROJECT_NAME", "")
@@ -69,7 +73,7 @@ class AppAgentConfig:
 
 def get_models(project_id: str) -> list:
     """Get all models for a project."""
-    url = f"{DOMINO_URL}/v4/modelManager/getModels"
+    url = f"{_API_BASE}/v4/modelManager/getModels"
     headers = {"X-Domino-Api-Key": API_KEY}
     resp = requests.get(url, params={"projectId": project_id}, headers=headers, timeout=30)
     resp.raise_for_status()
@@ -85,12 +89,12 @@ def discover_genai_endpoints(project_id: str, project_name: str) -> list[GenAIEn
     """
     genai_endpoints = []
 
-    # Build the apps domain: https://se-demo.domino.tech:443 -> https://apps.se-demo.domino.tech
+    # Build the apps domain: https://se-demo.domino.tech -> https://apps.se-demo.domino.tech
     from urllib.parse import urlparse
     parsed = urlparse(DOMINO_URL)
     apps_base = f"{parsed.scheme}://apps.{parsed.hostname}"
 
-    url = f"{DOMINO_URL}/v4/modelProducts"
+    url = f"{_API_BASE}/v4/modelProducts"
     headers = {"X-Domino-Api-Key": API_KEY}
     try:
         resp = requests.get(url, params={"projectId": project_id}, headers=headers, timeout=30)
@@ -147,7 +151,7 @@ def discover_agent_apps(project_id: str) -> list[AppAgentConfig]:
     # Step 1: Find AISYSTEM apps
     try:
         resp = requests.get(
-            f"{DOMINO_URL}/api/apps/beta/apps",
+            f"{_API_BASE}/api/apps/beta/apps",
             params={"projectId": project_id, "status": "Running"},
             headers=headers,
             timeout=30,
@@ -330,7 +334,7 @@ def extract_help_topic_url(endpoint_url: str, domino_base_url: str) -> str:
         return ""
 
     model_id = match.group(1)
-    base_url = domino_base_url.rstrip(':443').rstrip('/')
+    base_url = domino_base_url.rstrip('/')
     project_owner = os.environ.get("DOMINO_PROJECT_OWNER", "")
     project_name = os.environ.get("DOMINO_PROJECT_NAME", "")
     params = []
@@ -482,7 +486,7 @@ def get_project_name(project_id: str) -> str:
     if PROJECT_NAME:
         return clean_function_name(PROJECT_NAME, prefix="Project")
 
-    url = f"{DOMINO_URL}/v4/projects/{project_id}"
+    url = f"{_API_BASE}/v4/projects/{project_id}"
     headers = {"X-Domino-Api-Key": API_KEY}
     try:
         resp = requests.get(url, headers=headers, timeout=15)
@@ -517,7 +521,7 @@ def discover_endpoints(project_id: str, project_name: str) -> tuple[list[Endpoin
         print(f"  Discovering: {name}...")
 
         # Build endpoint URL from API metadata
-        endpoint_url = f"{DOMINO_URL}:443/models/{model_id}/latest/model"
+        endpoint_url = f"{DOMINO_URL}/models/{model_id}/latest/model"
 
         # Try to get the signature from MLflow.
         # If Domino's activeVersion doesn't carry registeredModelVersion (e.g. newly
@@ -2123,7 +2127,12 @@ def main():
         print("Error: DOMINO_PROJECT_ID environment variable is required")
         return
 
-    print(f"Domino URL: {DOMINO_URL}")
+    if not DOMINO_URL:
+        print("Warning: DOMINO_URL is not set. API calls will use DOMINO_API_PROXY,")
+        print("  but generated endpoint URLs in the Excel add-in may be incorrect.")
+        print(f"  Using API base: {_API_BASE}")
+    else:
+        print(f"Domino URL: {DOMINO_URL}")
     print(f"Project ID: {project_id}")
     print()
 
