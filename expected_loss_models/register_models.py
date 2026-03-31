@@ -28,6 +28,66 @@ CODE_PATHS = [
 ]
 
 
+# ---------------------------------------------------------------------------
+# Domino environment resolution
+# ---------------------------------------------------------------------------
+
+def _get_domino_url() -> str:
+    """Return the Domino base URL from environment variables."""
+    return (os.environ.get("DOMINO_URL") or os.environ.get("DOMINO_API_HOST") or "").rstrip("/")
+
+
+def _get_project_default_environment_id(domino_url: str, api_key: str, project_id: str) -> str | None:
+    """Fetch the project's default environment ID from the Domino API."""
+    headers = {"X-Domino-Api-Key": api_key}
+    for path in [
+        f"/v4/projects/{project_id}/settings",
+        f"/api/projects/v1/projects/{project_id}/settings",
+    ]:
+        try:
+            resp = requests.get(f"{domino_url}{path}", headers=headers, timeout=30)
+            resp.raise_for_status()
+            env_id = resp.json().get("defaultEnvironmentId")
+            if env_id:
+                return env_id
+        except requests.RequestException:
+            continue
+    return None
+
+
+def _resolve_domino_config() -> dict:
+    """Resolve all Domino connection details once.
+
+    Returns a dict with keys: url, api_key, project_id, environment_id.
+    Any value may be empty if not available.
+    """
+    domino_url = _get_domino_url()
+    api_key = os.environ.get("DOMINO_USER_API_KEY", "")
+    project_id = os.environ.get("DOMINO_PROJECT_ID", "")
+
+    # Environment ID: explicit env var first, then project default
+    environment_id = os.environ.get("DOMINO_ENVIRONMENT_ID", "")
+    env_source = "DOMINO_ENVIRONMENT_ID"
+
+    if not environment_id and domino_url and api_key and project_id:
+        environment_id = _get_project_default_environment_id(domino_url, api_key, project_id) or ""
+        env_source = "project default environment" if environment_id else "not found"
+
+    if environment_id:
+        print(f"Using environment from {env_source}: {environment_id}")
+
+    return {
+        "url": domino_url,
+        "api_key": api_key,
+        "project_id": project_id,
+        "environment_id": environment_id,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Example data builders
+# ---------------------------------------------------------------------------
+
 def _curve_examples():
     curve_input = pd.DataFrame({"curve_date": ["2024-12-31"]})
     curve_output = build_credit_curve("2024-12-31")
@@ -113,15 +173,17 @@ def _stringify_columns(df: pd.DataFrame, columns: list[str]) -> pd.DataFrame:
     return result
 
 
-def domino_short_id(length: int = 8) -> str:
-    def short_fallback() -> str:
+# ---------------------------------------------------------------------------
+# Naming helpers
+# ---------------------------------------------------------------------------
+
+def _domino_short_id(length: int = 8) -> str:
+    def _fallback() -> str:
         return base64.urlsafe_b64encode(uuid.uuid4().bytes).decode("utf-8").rstrip("=")[:length]
 
-    user = os.environ.get("DOMINO_PROJECT_OWNER") or short_fallback()
-    project = os.environ.get("DOMINO_PROJECT_ID") or short_fallback()
-
-    combined = f"{user}/{project}"
-    digest = hashlib.sha256(combined.encode()).digest()
+    user = os.environ.get("DOMINO_PROJECT_OWNER") or _fallback()
+    project = os.environ.get("DOMINO_PROJECT_ID") or _fallback()
+    digest = hashlib.sha256(f"{user}/{project}".encode()).digest()
     encoded = base64.urlsafe_b64encode(digest).decode("utf-8").rstrip("=")
     return f"{user}_{encoded[:length]}"
 
@@ -134,10 +196,30 @@ def _camel_case(name: str) -> str:
 
 
 def _experiment_name(model_name: str) -> str:
-    return f"{_camel_case(model_name)}_{domino_short_id()}"
+    return f"{_camel_case(model_name)}_{_domino_short_id()}"
 
 
-def resolve_registered_model_version(model_name: str, model_info: object) -> int | None:
+def _normalize_endpoint_name(name: str) -> str:
+    if not any(ch for ch in name if not ch.isalnum()):
+        return name
+    parts = []
+    current = []
+    for ch in name:
+        if ch.isalnum():
+            current.append(ch)
+        elif current:
+            parts.append("".join(current))
+            current = []
+    if current:
+        parts.append("".join(current))
+    return "".join(part[:1].upper() + part[1:] for part in parts if part)
+
+
+# ---------------------------------------------------------------------------
+# MLflow model version resolution
+# ---------------------------------------------------------------------------
+
+def _resolve_registered_model_version(model_name: str, model_info: object) -> int | None:
     version_value = getattr(model_info, "registered_model_version", None)
     if version_value is not None:
         try:
@@ -154,249 +236,142 @@ def resolve_registered_model_version(model_name: str, model_info: object) -> int
     return None
 
 
-def resolve_domino_url() -> tuple[str, str]:
-    url = os.environ.get("DOMINO_URL", "")
-    if not url:
-        url = os.environ.get("DOMINO_API_HOST", "")
-    return url, "DOMINO_URL"
+# ---------------------------------------------------------------------------
+# Domino Model API registration
+# ---------------------------------------------------------------------------
 
-
-def resolve_environment_id(
-    domino_url: str,
-    api_key: str,
-    environment_id: str,
-    project_id: str,
-) -> tuple[str | None, str]:
-    if environment_id:
-        return environment_id, "DOMINO_ENVIRONMENT_ID"
-
-    if not (domino_url and api_key and project_id):
-        return None, "missing DOMINO_URL/DOMINO_USER_API_KEY/DOMINO_PROJECT_ID"
-
-    # Get the project's default environment ID from the Domino API
-    headers = {"X-Domino-Api-Key": api_key}
-
-    # Try /v4/projects/{id}/settings first
-    for endpoint in [
-        f"{domino_url}/v4/projects/{project_id}/settings",
-        f"{domino_url}/api/projects/v1/projects/{project_id}/settings",
-    ]:
-        try:
-            response = requests.get(endpoint, headers=headers, timeout=30)
-            response.raise_for_status()
-            settings = response.json()
-            default_env = settings.get("defaultEnvironmentId")
-            if default_env:
-                return default_env, "project default environment"
-        except requests.RequestException:
-            continue
-
-    return None, "no default environment found for project"
-
-
-def normalize_endpoint_name(name: str) -> str:
-    if not any(ch for ch in name if not ch.isalnum()):
-        return name
-    parts = []
-    current = []
-    for ch in name:
-        if ch.isalnum():
-            current.append(ch)
-        elif current:
-            parts.append("".join(current))
-            current = []
-    if current:
-        parts.append("".join(current))
-    return "".join(part[:1].upper() + part[1:] for part in parts if part)
-
-
-def _find_model_api_id(
-    domino_url: str,
-    headers: dict,
-    project_id: str,
-    model_api_name: str,
-) -> str | None:
+def _find_model_api_id(domino_url: str, headers: dict, project_id: str, name: str) -> str | None:
     try:
-        response = requests.get(
+        resp = requests.get(
             f"{domino_url}/api/modelServing/v1/modelApis",
-            params={"projectId": project_id, "name": model_api_name},
+            params={"projectId": project_id, "name": name},
             headers=headers,
             timeout=30,
         )
-        response.raise_for_status()
+        resp.raise_for_status()
     except requests.RequestException:
         return None
-
-    payload = response.json()
-    items = payload.get("items", [])
-    for item in items:
-        if item.get("name") == model_api_name and not item.get("archived", False):
+    for item in resp.json().get("items", []):
+        if item.get("name") == name and not item.get("archived", False):
             return item.get("id")
     return None
 
 
-def _get_model_api_by_id(
-    domino_url: str,
-    headers: dict,
-    model_api_id: str,
-) -> dict | None:
+def _get_model_api(domino_url: str, headers: dict, model_api_id: str) -> dict | None:
     try:
-        response = requests.get(
+        resp = requests.get(
             f"{domino_url}/api/modelServing/v1/modelApis/{model_api_id}",
             headers=headers,
             timeout=30,
         )
-        response.raise_for_status()
+        resp.raise_for_status()
+        payload = resp.json()
+        return payload if isinstance(payload, dict) else None
     except requests.RequestException:
         return None
-    payload = response.json()
-    return payload if isinstance(payload, dict) else None
 
 
-def register_model_api_endpoint(
+def _register_model_api_endpoint(
     model_api_name: str,
     registered_model_name: str,
     registered_model_version: int,
+    config: dict,
 ) -> None:
-    domino_url, domino_url_source = resolve_domino_url()
-    domino_url = domino_url.rstrip("/")
-    api_key = os.environ.get("DOMINO_USER_API_KEY", "")
-    project_id = os.environ.get("DOMINO_PROJECT_ID", "")
-    environment_id = os.environ.get("DOMINO_ENVIRONMENT_ID", "")
-    resolved_environment_id, env_source = resolve_environment_id(
-        domino_url,
-        api_key,
-        environment_id,
-        project_id,
-    )
+    domino_url = config["url"]
+    api_key = config["api_key"]
+    project_id = config["project_id"]
+    environment_id = config["environment_id"]
 
-    if not (domino_url and api_key and project_id and resolved_environment_id):
-        missing = [
-            name
-            for name, value in {
-                "DOMINO_URL": domino_url,
-                "DOMINO_USER_API_KEY": api_key,
-                "DOMINO_PROJECT_ID": project_id,
-                "DOMINO_ENVIRONMENT_ID": resolved_environment_id,
-            }.items()
-            if not value
-        ]
-        print(f"Skipping model API registration; missing: {', '.join(missing)}")
+    if not (domino_url and api_key and project_id and environment_id):
+        missing = [k for k in ("url", "api_key", "project_id", "environment_id") if not config[k]]
+        print(f"Skipping model API registration for {model_api_name}; missing: {', '.join(missing)}")
         return
 
-    print(
-        "Using Domino URL from "
-        f"{domino_url_source} and environment from {env_source}."
-    )
     prediction_dataset_id = os.environ.get("DOMINO_PREDICTION_DATASET_ID", "").strip()
-    monitoring_enabled = bool(prediction_dataset_id)
-    description = (
-        f"Model API for registered model {registered_model_name} "
-        f"v{registered_model_version}"
-    )
-    payload = {
-        "name": model_api_name,
-        "description": description,
-        "environmentId": resolved_environment_id,
-        "isAsync": False,
-        "strictNodeAntiAffinity": False,
-        "environmentVariables": [],
-        "version": {
-            "projectId": project_id,
-            "environmentId": resolved_environment_id,
-            "source": {
-                "type": "Registry",
-                "registeredModelName": registered_model_name,
-                "registeredModelVersion": registered_model_version,
-            },
-            "logHttpRequestResponse": True,
-            "monitoringEnabled": monitoring_enabled,
-            "recordInvocation": True,
-            "shouldDeploy": True,
-            "description": description,
+    description = f"Model API for registered model {registered_model_name} v{registered_model_version}"
+
+    version_payload = {
+        "projectId": project_id,
+        "environmentId": environment_id,
+        "source": {
+            "type": "Registry",
+            "registeredModelName": registered_model_name,
+            "registeredModelVersion": registered_model_version,
         },
+        "logHttpRequestResponse": True,
+        "monitoringEnabled": bool(prediction_dataset_id),
+        "recordInvocation": True,
+        "shouldDeploy": True,
+        "description": description,
     }
     if prediction_dataset_id:
-        payload["version"]["predictionDatasetResourceId"] = prediction_dataset_id
+        version_payload["predictionDatasetResourceId"] = prediction_dataset_id
 
     headers = {"X-Domino-Api-Key": api_key}
-    existing_id = _find_model_api_id(
-        domino_url,
-        headers,
-        project_id,
-        model_api_name,
-    )
+    existing_id = _find_model_api_id(domino_url, headers, project_id, model_api_name)
+
     if existing_id:
-        existing_api = _get_model_api_by_id(domino_url, headers, existing_id) or {}
+        # Update existing endpoint metadata
+        existing_api = _get_model_api(domino_url, headers, existing_id) or {}
         update_payload = {
             "name": model_api_name,
             "description": description,
-            "environmentId": resolved_environment_id,
+            "environmentId": environment_id,
             "replicas": existing_api.get("replicas", 1),
         }
-        if "hardwareTierId" in existing_api:
-            update_payload["hardwareTierId"] = existing_api.get("hardwareTierId")
-        if "resourceQuotaId" in existing_api:
-            update_payload["resourceQuotaId"] = existing_api.get("resourceQuotaId")
+        for key in ("hardwareTierId", "resourceQuotaId"):
+            if key in existing_api:
+                update_payload[key] = existing_api[key]
         try:
-            update_response = requests.put(
+            requests.put(
                 f"{domino_url}/api/modelServing/v1/modelApis/{existing_id}",
-                json=update_payload,
-                headers=headers,
-                timeout=30,
-            )
-            update_response.raise_for_status()
+                json=update_payload, headers=headers, timeout=30,
+            ).raise_for_status()
             print(f"Updated model API metadata for {model_api_name} (id={existing_id})")
         except requests.RequestException as exc:
             details = getattr(getattr(exc, "response", None), "text", "")
-            print(
-                f"Failed to update model API metadata for {model_api_name}: {exc}"
-                f"{' - ' + details if details else ''}"
-            )
+            print(f"Failed to update model API metadata for {model_api_name}: {exc}{' - ' + details if details else ''}")
 
-        version_payload = payload["version"]
-        version_payload["projectId"] = project_id
-        version_payload["environmentId"] = resolved_environment_id
+        # Add new version
         try:
-            response = requests.post(
+            resp = requests.post(
                 f"{domino_url}/api/modelServing/v1/modelApis/{existing_id}/versions",
-                json=version_payload,
-                headers=headers,
-                timeout=30,
+                json=version_payload, headers=headers, timeout=30,
             )
-            response.raise_for_status()
-            version_info = response.json()
-            version_id = version_info.get("id", "unknown")
-            print(
-                f"Registered model API version {version_id} for endpoint "
-                f"{model_api_name} (id={existing_id})"
-            )
+            resp.raise_for_status()
+            version_id = resp.json().get("id", "unknown")
+            print(f"Registered model API version {version_id} for {model_api_name} (id={existing_id})")
         except requests.RequestException as exc:
             details = getattr(getattr(exc, "response", None), "text", "")
-            print(
-                f"Failed to create model API version for {model_api_name}: {exc}"
-                f"{' - ' + details if details else ''}"
-            )
+            print(f"Failed to create model API version for {model_api_name}: {exc}{' - ' + details if details else ''}")
         return
 
+    # Create new endpoint
+    payload = {
+        "name": model_api_name,
+        "description": description,
+        "environmentId": environment_id,
+        "isAsync": False,
+        "strictNodeAntiAffinity": False,
+        "environmentVariables": [],
+        "version": version_payload,
+    }
     try:
-        response = requests.post(
+        resp = requests.post(
             f"{domino_url}/api/modelServing/v1/modelApis",
-            json=payload,
-            headers=headers,
-            timeout=30,
+            json=payload, headers=headers, timeout=30,
         )
-        response.raise_for_status()
-        model_api = response.json()
-        model_api_id = model_api.get("id", "unknown")
+        resp.raise_for_status()
+        model_api_id = resp.json().get("id", "unknown")
         print(f"Registered model API endpoint {model_api_name} (id={model_api_id})")
     except requests.RequestException as exc:
         details = getattr(getattr(exc, "response", None), "text", "")
-        print(
-            f"Failed to create model API endpoint {model_api_name}: {exc}"
-            f"{' - ' + details if details else ''}"
-        )
+        print(f"Failed to create model API endpoint {model_api_name}: {exc}{' - ' + details if details else ''}")
 
+
+# ---------------------------------------------------------------------------
+# Main registration flow
+# ---------------------------------------------------------------------------
 
 def register_models():
     rng = np.random.default_rng()
@@ -413,58 +388,41 @@ def register_models():
     pd_input, pd_output = _pd_examples(np.random.default_rng(0))
 
     pd_numeric_cols = [
-        "credit_score",
-        "debt_to_income_ratio",
-        "loan_to_value_ratio",
-        "loan_age_months",
-        "original_principal_balance",
-        "interest_rate",
-        "employment_years",
-        "delinquency_30d_past_12m",
-        "tenor",
+        "credit_score", "debt_to_income_ratio", "loan_to_value_ratio",
+        "loan_age_months", "original_principal_balance", "interest_rate",
+        "employment_years", "delinquency_30d_past_12m", "tenor",
     ]
     pd_input_example = _stringify_columns(pd_input, pd_numeric_cols)
     pd_signature = ModelSignature(
         inputs=Schema([ColSpec("string", name=col) for col in pd_input_example.columns]),
-        outputs=Schema(
-            [
-                ColSpec("double", name="probability_of_default"),
-            ]
-        ),
+        outputs=Schema([ColSpec("double", name="probability_of_default")]),
     )
 
     curve_tenors = curve_output["years"].astype(float).tolist()
     curve_rates = curve_output["risk_free_rate"].astype(float).tolist()
     el_input, el_output = _el_examples(pd_input, curve_tenors, curve_rates, rng)
     el_numeric_cols = [
-        "probability_of_default_1y",
-        "probability_of_default_maturity",
-        "loan_to_value_ratio",
-        "current_balance",
-        "remaining_term_years",
+        "probability_of_default_1y", "probability_of_default_maturity",
+        "loan_to_value_ratio", "current_balance", "remaining_term_years",
     ]
     el_input_example = _stringify_columns(el_input, el_numeric_cols)
     el_signature = ModelSignature(
-        inputs=Schema(
-            [
-                ColSpec("string", name="probability_of_default_1y"),
-                ColSpec("string", name="probability_of_default_maturity"),
-                ColSpec("string", name="loan_to_value_ratio"),
-                ColSpec("string", name="current_balance"),
-                ColSpec("string", name="remaining_term_years"),
-                ColSpec(Array("double"), name="curve_tenors"),
-                ColSpec(Array("double"), name="curve_rates"),
-            ]
-        ),
-        outputs=Schema(
-            [
-                ColSpec("string", name="implied_credit_rating"),
-                ColSpec("double", name="implied_lgd"),
-                ColSpec("double", name="el_undiscounted"),
-                ColSpec("double", name="el_discounted"),
-                ColSpec("double", name="rwa"),
-            ]
-        ),
+        inputs=Schema([
+            ColSpec("string", name="probability_of_default_1y"),
+            ColSpec("string", name="probability_of_default_maturity"),
+            ColSpec("string", name="loan_to_value_ratio"),
+            ColSpec("string", name="current_balance"),
+            ColSpec("string", name="remaining_term_years"),
+            ColSpec(Array("double"), name="curve_tenors"),
+            ColSpec(Array("double"), name="curve_rates"),
+        ]),
+        outputs=Schema([
+            ColSpec("string", name="implied_credit_rating"),
+            ColSpec("double", name="implied_lgd"),
+            ColSpec("double", name="el_undiscounted"),
+            ColSpec("double", name="el_discounted"),
+            ColSpec("double", name="rwa"),
+        ]),
     )
 
     inventory_input, inventory_output = _inventory_examples()
@@ -473,23 +431,21 @@ def register_models():
             ColSpec("string", name="inventory_date"),
             ColSpec("long", name="number_of_items"),
         ]),
-        outputs=Schema(
-            [
-                ColSpec("string", name="loan_id"),
-                ColSpec("double", name="credit_score"),
-                ColSpec("double", name="debt_to_income_ratio"),
-                ColSpec("double", name="loan_to_value_ratio"),
-                ColSpec("double", name="loan_age_months"),
-                ColSpec("double", name="original_principal_balance"),
-                ColSpec("double", name="current_balance"),
-                ColSpec("double", name="interest_rate"),
-                ColSpec("double", name="employment_years"),
-                ColSpec("double", name="delinquency_30d_past_12m"),
-                ColSpec("string", name="loan_purpose"),
-                ColSpec("double", name="original_loan_term_years"),
-                ColSpec("double", name="remaining_term_years"),
-            ]
-        ),
+        outputs=Schema([
+            ColSpec("string", name="loan_id"),
+            ColSpec("double", name="credit_score"),
+            ColSpec("double", name="debt_to_income_ratio"),
+            ColSpec("double", name="loan_to_value_ratio"),
+            ColSpec("double", name="loan_age_months"),
+            ColSpec("double", name="original_principal_balance"),
+            ColSpec("double", name="current_balance"),
+            ColSpec("double", name="interest_rate"),
+            ColSpec("double", name="employment_years"),
+            ColSpec("double", name="delinquency_30d_past_12m"),
+            ColSpec("string", name="loan_purpose"),
+            ColSpec("double", name="original_loan_term_years"),
+            ColSpec("double", name="remaining_term_years"),
+        ]),
     )
 
     curve_metrics = {
@@ -504,7 +460,6 @@ def register_models():
         "tenor_count": float(len(curve_output)),
         "spread_ratings": float(len([c for c in curve_output.columns if c.startswith("spread_")])),
     }
-
     el_metrics = {
         "total_el_undiscounted": float(el_output["el_undiscounted"].sum()),
         "total_el_discounted": float(el_output["el_discounted"].sum()),
@@ -514,12 +469,12 @@ def register_models():
         "example_loan_count": float(len(el_input)),
         "curve_length": float(len(curve_tenors)),
     }
-
     inventory_params = {
         "inventory_date": str(inventory_input["inventory_date"].iloc[0]),
         "loan_count": float(len(inventory_output)),
     }
 
+    # Register models to MLflow
     mlflow.set_experiment(_experiment_name("GetCreditCurves"))
     with mlflow.start_run():
         mlflow.log_params(curve_params)
@@ -572,21 +527,23 @@ def register_models():
             registered_model_name="GetLoanInventory",
         )
 
+    # Register Domino Model API endpoints
+    config = _resolve_domino_config()
     for model_name, model_info in [
         ("GetCreditCurves", curve_model_info),
         ("GetLoanProbabilityOfDefault", pd_model_info),
         ("GetExpectedLoss", el_model_info),
         ("GetLoanInventory", inventory_model_info),
     ]:
-        version = resolve_registered_model_version(model_name, model_info)
+        version = _resolve_registered_model_version(model_name, model_info)
         if version is None:
             print(f"Skipping model API registration for {model_name}; no version found.")
             continue
-        endpoint_name = normalize_endpoint_name(model_name)
-        register_model_api_endpoint(
-            model_api_name=endpoint_name,
+        _register_model_api_endpoint(
+            model_api_name=_normalize_endpoint_name(model_name),
             registered_model_name=model_name,
             registered_model_version=version,
+            config=config,
         )
 
 
